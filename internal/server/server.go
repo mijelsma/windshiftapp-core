@@ -26,6 +26,7 @@ import (
 	"windshift/internal/aitools"
 	"windshift/internal/auth"
 	"windshift/internal/authz"
+	"windshift/internal/blobstore"
 	"windshift/internal/config"
 	"windshift/internal/database"
 	"windshift/internal/email"
@@ -668,7 +669,40 @@ func (s *Server) initialize() error {
 	if webAuthnConfig != nil {
 		webAuthnHandler = handlers.NewWebAuthnHandler(s.db, permService, sessionManager, webAuthnConfig, ipExtractor)
 	}
-	publicBoardHandler := handlers.NewPublicBoardHandler(s.db, permService, cfg.AttachmentPath)
+	attachmentStorage, storageErr := newAttachmentStorage(cfg)
+	if storageErr != nil {
+		return fmt.Errorf("initialize attachment storage: %w", storageErr)
+	}
+	if attachmentStorage.Enabled() {
+		if attachmentStorage.Backend() == config.StorageBackendS3 {
+			// The S3 probe retries transient failures and tolerates an
+			// AccessDenied HeadBucket; see blobstore.probeWithRetry.
+			if err := attachmentStorage.Probe(context.Background()); err != nil {
+				return fmt.Errorf("attachment object storage is unavailable: %w", err)
+			}
+		}
+		slog.Info("attachments enabled", "backend", attachmentStorage.Backend(), "location", attachmentStorage.Describe())
+	} else {
+		slog.Info("attachments disabled (no attachment path specified)")
+	}
+	// Readiness (/readyz) reports attachment reachability; liveness (/healthz)
+	// intentionally does not depend on it.
+	healthHandler.SetAttachmentProbe(attachmentStorage)
+	// Item deletion removes attachment blobs through the configured backend.
+	services.SetItemAttachmentBlobRemover(attachmentStorage)
+
+	// CSV import staging is transient and stays on local disk. Local mode keeps
+	// the historical ATTACHMENT_PATH behaviour (empty disables imports); S3 mode
+	// falls back to the OS temp directory when no local path is configured.
+	importScratch := cfg.Storage.LocalPath
+	if importScratch == "" {
+		importScratch = cfg.AttachmentPath
+	}
+	if importScratch == "" && cfg.Storage.Backend == config.StorageBackendS3 {
+		importScratch = os.TempDir()
+	}
+
+	publicBoardHandler := handlers.NewPublicBoardHandler(s.db, permService, attachmentStorage)
 	permissionHandler := handlers.NewPermissionHandlerWithCache(repository.NewPermissionRepository(s.db), permService, logger.NewAuditor(s.db))
 	apiTokenHandler := handlers.NewAPITokenHandler(
 		tokenManager,
@@ -720,7 +754,7 @@ func (s *Server) initialize() error {
 	pageApplication := services.NewPageApplicationService(pageService, pagePermissionService)
 	pageDiagramService := services.NewPageDiagramService(
 		s.db,
-		cfg.AttachmentPath,
+		attachmentStorage,
 		pageApplication,
 		pagePermissionService,
 		permService,
@@ -981,7 +1015,7 @@ func (s *Server) initialize() error {
 	assetHandler := handlers.NewAssetHandler(s.db, permService, cfg.AttachmentPath)
 	assetApplication := services.NewAssetApplicationService(s.db, permService, assetHandler.AssetService(), assetHandler.AssetPermissionService()).
 		WithLinks(itemLinkService).
-		WithImportStorage(cfg.AttachmentPath)
+		WithImportStorage(importScratch)
 	s.actionService.SetAssetNodeServices(assetHandler.AssetService(), assetHandler.AssetPermissionService())
 	if n, err := assetApplication.ReconcileInterruptedImports(); err != nil {
 		slog.Warn("failed to reconcile interrupted asset imports", slog.Any("error", err))
@@ -1000,7 +1034,7 @@ func (s *Server) initialize() error {
 	)
 	assetActionHandler := handlers.NewAssetActionHandler(repository.NewAssetActionRepository(s.db), assetHandler, s.assetActionService, logger.NewAuditor(s.db))
 
-	jiraImportHandler := handlers.NewJiraImportHandler(s.db, cfg.Auth.SessionSecret, cfg.Jira.CapturePayloadsDir).
+	jiraImportHandler := handlers.NewJiraImportHandler(s.db, cfg.Auth.SessionSecret, cfg.Jira.CapturePayloadsDir, attachmentStorage).
 		WithAuthorizationCacheInvalidator(authorizationCacheInvalidator)
 	if n, err := jiraImportHandler.ReconcileInterruptedImports(); err != nil {
 		slog.Warn("failed to reconcile interrupted Jira imports", slog.Any("error", err))
@@ -1015,13 +1049,13 @@ func (s *Server) initialize() error {
 	emailProviderHandler := handlers.NewEmailProviderHandler(s.db, scmProviderHandler.GetEncryption(), baseURL, channelService)
 	emailProviderHandler.SetCredentialManager(emailCredManager)
 
-	s.ticketImport = services.NewTicketImportService(s.db, permService, cfg.AttachmentPath)
+	s.ticketImport = services.NewTicketImportService(s.db, permService, importScratch)
 	if n, err := s.ticketImport.ReconcileInterrupted(); err != nil {
 		slog.Warn("failed to reconcile interrupted ticket imports", slog.Any("error", err))
 	} else if n > 0 {
 		slog.Info("reconciled interrupted ticket imports", slog.Int("count", n))
 	}
-	s.emailScheduler = scheduler.NewEmailScheduler(s.db, emailCredManager, cfg.AttachmentPath)
+	s.emailScheduler = scheduler.NewEmailScheduler(s.db, emailCredManager, attachmentStorage)
 	s.emailScheduler.Start()
 	slog.Info("email scheduler started (IMAP polling)")
 
@@ -1314,7 +1348,7 @@ func (s *Server) initialize() error {
 
 	// Webhook handler
 	webhookHandler := handlers.NewWebhookHandler(repository.NewChannelRepository(s.db), repository.NewItemRepository(s.db), webhookSender, permService, channelService, logger.NewAuditor(s.db))
-	portalHandler := handlers.NewPortalHandler(s.db, sessionManager, portalSessionManager, ipExtractor, cfg.AttachmentPath)
+	portalHandler := handlers.NewPortalHandler(s.db, sessionManager, portalSessionManager, ipExtractor, attachmentStorage)
 	portalHandler.SetApprovalService(approvalService)
 	portalHandler.SetEventCoordinator(eventCoordinator)
 	portalHandler.SetChannelService(channelService)
@@ -1348,20 +1382,17 @@ func (s *Server) initialize() error {
 
 	var attachmentHandler *handlers.AttachmentHandler
 	var attachmentSettingsHandler *handlers.AttachmentSettingsHandler
-	if cfg.AttachmentPath != "" {
-		slog.Info("attachments enabled", "path", cfg.AttachmentPath)
-		attachmentHandler = handlers.NewAttachmentHandler(s.db, cfg.AttachmentPath, permService)
+	if attachmentStorage.Enabled() {
+		attachmentHandler = handlers.NewAttachmentHandler(s.db, attachmentStorage, permService)
 		attachmentHandler.SetApprovalService(approvalService)
 		attachmentHandler.SetPagePermissionService(pagePermissionService)
 		attachmentHandler.SetChannelService(channelService)
-		attachmentSettingsService := services.NewAttachmentSettingsService(s.db)
-		if err := attachmentSettingsService.Initialize(cfg.AttachmentPath); err != nil {
+		attachmentSettingsService := services.NewAttachmentSettingsService(s.db, attachmentStorage)
+		if err := attachmentSettingsService.Initialize(); err != nil {
 			slog.Warn("failed to initialize attachment settings", "error", err)
 		}
-		formHandler.SetItemAttachmentService(services.NewItemAttachmentService(s.db, cfg.AttachmentPath, permService))
+		formHandler.SetItemAttachmentService(services.NewItemAttachmentService(s.db, attachmentStorage, permService))
 		attachmentSettingsHandler = handlers.NewAttachmentSettingsHandler(attachmentSettingsService, logger.NewAuditor(s.db))
-	} else {
-		slog.Info("attachments disabled (no attachment path specified)")
 	}
 
 	itemDiagramService := services.NewItemDiagramService(repository.NewDiagramRepository(s.db))
@@ -1852,7 +1883,7 @@ func (s *Server) initialize() error {
 		TokenManager:                   tokenManager,
 		PermissionService:              permService,
 		ActionService:                  s.actionService,
-		AttachmentPath:                 cfg.AttachmentPath,
+		Storage:                        attachmentStorage,
 		ItemLinkService:                itemLinkService,
 		AssetPermissionService:         assetHandler.AssetPermissionService(),
 		AssetService:                   assetHandler.AssetService(),
@@ -1983,8 +2014,8 @@ func (s *Server) initialize() error {
 		AdminTranslations:            objectTranslationService,
 		Comments:                     commentService,
 		CommentAccess:                permService,
-		Attachments:                  services.NewItemAttachmentService(s.db, cfg.AttachmentPath, permService),
-		PageAttachments:              services.NewPageAttachmentUploadService(s.db, cfg.AttachmentPath, permService, pagePermissionService),
+		Attachments:                  services.NewItemAttachmentService(s.db, attachmentStorage, permService),
+		PageAttachments:              services.NewPageAttachmentUploadService(s.db, attachmentStorage, permService, pagePermissionService),
 		Collections:                  services.NewCollectionApplicationService(s.db, permService),
 		Planning:                     planningApplication,
 		Links:                        itemLinkService,
@@ -1998,7 +2029,7 @@ func (s *Server) initialize() error {
 		ItemApplication:              itemApplication,
 		ItemDetail:                   itemDetailApplication,
 		ItemLifecycle:                services.NewItemLifecycleService(s.db, permService),
-		TicketImport:                 services.NewTicketImportService(s.db, permService, cfg.AttachmentPath),
+		TicketImport:                 services.NewTicketImportService(s.db, permService, importScratch),
 		SessionMiddleware:            authMiddleware.OptionalAuth,
 		SearchAllowed:                s.searchLimiter.AllowRequest,
 		DBRequestTimeout:             s.config.DB.RequestTimeout,
@@ -3201,4 +3232,30 @@ func bootCodingAgentRunService(
 		return nil, fmt.Errorf("coding-agent run service: %w", err)
 	}
 	return runSvc, nil
+}
+
+// newAttachmentStorage builds the configured attachment blob backend. Local
+// disk stays the zero-config default; S3 is opt-in via STORAGE_BACKEND=s3.
+func newAttachmentStorage(cfg Config) (*blobstore.Store, error) {
+	localPath := cfg.Storage.LocalPath
+	if localPath == "" {
+		// Callers that build Config directly (rather than via config.Load) still
+		// get the historical ATTACHMENT_PATH behaviour.
+		localPath = cfg.AttachmentPath
+	}
+	switch cfg.Storage.Backend {
+	case config.StorageBackendS3:
+		return blobstore.NewS3(blobstore.S3Config{
+			Endpoint:        cfg.Storage.S3.Endpoint,
+			Bucket:          cfg.Storage.S3.Bucket,
+			Region:          cfg.Storage.S3.Region,
+			AccessKeyID:     cfg.Storage.S3.AccessKeyID,
+			SecretAccessKey: cfg.Storage.S3.SecretAccessKey,
+			Prefix:          cfg.Storage.S3.Prefix,
+			ForcePathStyle:  cfg.Storage.S3.ForcePathStyle,
+			LocalRoot:       localPath,
+		})
+	default:
+		return blobstore.NewLocal(localPath), nil
+	}
 }

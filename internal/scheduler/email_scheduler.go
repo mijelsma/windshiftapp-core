@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"windshift/internal/blobstore"
 	"windshift/internal/database"
 	"windshift/internal/email"
 	"windshift/internal/models"
@@ -31,7 +32,7 @@ type EmailScheduler struct {
 	mu              sync.RWMutex
 	running         bool
 	defaultInterval time.Duration
-	attachmentPath  string
+	storage         *blobstore.Store
 
 	// providerForChannel resolves the IMAP provider + decrypted config for a
 	// channel. Defaults to CredentialManager.GetProviderForChannel; tests
@@ -41,17 +42,17 @@ type EmailScheduler struct {
 }
 
 // NewEmailScheduler creates a new email scheduler
-func NewEmailScheduler(db database.Database, credentials *email.CredentialManager, attachmentPath string) *EmailScheduler {
+func NewEmailScheduler(db database.Database, credentials *email.CredentialManager, storage *blobstore.Store) *EmailScheduler {
 	return &EmailScheduler{
 		db:                 db,
 		credentials:        credentials,
-		processor:          email.NewProcessor(db, attachmentPath),
+		processor:          email.NewProcessor(db, storage),
 		parser:             email.NewParser(),
 		runRepo:            repository.NewSchedulerRunRepository(db),
 		stopChan:           make(chan struct{}),
 		running:            false,
 		defaultInterval:    5 * time.Minute,
-		attachmentPath:     attachmentPath,
+		storage:            storage,
 		providerForChannel: credentials.GetProviderForChannel,
 	}
 }
